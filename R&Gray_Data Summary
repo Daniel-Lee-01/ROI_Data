@@ -1,0 +1,251 @@
+import os
+import re
+import pandas as pd
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from datetime import datetime
+import subprocess
+import sys
+
+# ---------- 工具函式 ----------
+def col_letter_to_index(col):
+    """Convert Excel column letters to 0-based index. e.g. A->0, B->1, AA->26"""
+    col = col.upper()
+    idx = 0
+    for ch in col:
+        if not ('A' <= ch <= 'Z'):
+            raise ValueError(f"Invalid column letter: {col}")
+        idx = idx * 26 + (ord(ch) - ord('A') + 1)
+    return idx - 1
+
+def parse_range(range_str):
+    """Parse 'B2:TF61' -> (row_start_inclusive0based, row_end_exclusive, col_start, col_end_exclusive)."""
+    if not range_str or not range_str.strip():
+        raise ValueError("Empty range")
+    m = re.match(r'\s*([A-Za-z]+)(\d+)\s*:\s*([A-Za-z]+)(\d+)\s*$', range_str)
+    if not m:
+        raise ValueError(f"Range 格式錯誤: {range_str} (範例: B2:TF61)")
+    c1, r1, c2, r2 = m.groups()
+    r_start = int(r1) - 1
+    r_end_excl = int(r2)     # iloc end is exclusive -> OK
+    c_start = col_letter_to_index(c1)
+    c_end_excl = col_letter_to_index(c2) + 1
+    return (r_start, r_end_excl, c_start, c_end_excl)
+
+def extract_numeric_from_df_range(df, rng):
+    """Return 1D pandas Series of numeric values within df for given parsed range tuple."""
+    r0, r1, c0, c1 = rng
+    # If requested slice outside df shape, iloc will return smaller/empty frame
+    sub = df.iloc[r0:r1, c0:c1]
+    flat = pd.Series(sub.values.ravel())
+    flat = pd.to_numeric(flat, errors='coerce').dropna()
+    return flat
+
+def try_open_file(path):
+    try:
+        if sys.platform.startswith('win'):
+            os.startfile(path)
+        elif sys.platform.startswith('darwin'):
+            subprocess.call(['open', path])
+        else:
+            subprocess.call(['xdg-open', path])
+    except Exception:
+        pass
+
+# ---------- 主處理函式 ----------
+def process_main_folder(main_folder, main_keyword, sheet_name, range1_str, range2_str, progress_bar, status_label):
+    # 檢查範圍輸入
+    ranges = []
+    try:
+        rng1 = parse_range(range1_str)
+        ranges.append(('R1', rng1))
+    except Exception as e:
+        messagebox.showerror("錯誤", f"區間1格式錯誤：{e}")
+        return
+    if range2_str and range2_str.strip():
+        try:
+            rng2 = parse_range(range2_str)
+            ranges.append(('R2', rng2))
+        except Exception as e:
+            messagebox.showerror("錯誤", f"區間2格式錯誤：{e}")
+            return
+
+    # 找子資料夾
+    subfolders = [d for d in sorted(os.listdir(main_folder)) if os.path.isdir(os.path.join(main_folder, d))]
+    if not subfolders:
+        messagebox.showwarning("警告", "選擇的資料夾內沒有子資料夾可處理。請確認資料結構。")
+        return
+
+    total = len(subfolders)
+    results = []
+
+    # 建立欄位順序說明（動態）
+    # 欄位包含： Folder, NumFilesFound, (對每次測量 M1..M4: Mx_FileName, 然後每個Range的 Sum/Mean/Max)
+    # 先處理資料再建立 DataFrame（較簡單）
+
+    processed = 0
+    progress_bar['value'] = 0
+    progress_bar['maximum'] = 100
+    root.update_idletasks()
+
+    for i, sub in enumerate(subfolders, start=1):
+        sub_path = os.path.join(main_folder, sub)
+        status_label.config(text=f"正在處理資料夾 {i}/{total} : {sub}")
+        root.update_idletasks()
+
+        # 找到子資料夾內的 Excel 檔案，過濾主檔名前綴（若有）
+        files_all = [f for f in sorted(os.listdir(sub_path)) 
+                     if (f.lower().endswith('.xlsx') or f.lower().endswith('.xls')) 
+                     and not f.startswith('~$')]
+        if main_keyword and main_keyword.strip():
+            files = [f for f in files_all if main_keyword in f]
+        else:
+            files = files_all
+
+        # 依照檔名排序 (alphabetical)，最多取前 4 個
+        files = sorted(files)[:4]
+        file_count = len(files)
+
+        row = {'Folder': sub, 'NumFilesFound': file_count}
+
+        # 對第1~4次量測（如果沒有檔案，欄位會保留為 NaN）
+        for meas_index in range(1, 5):
+            key_prefix = f'M{meas_index}'
+            if meas_index <= file_count:
+                fname = files[meas_index - 1]
+                row[f'{key_prefix}_FileName'] = fname
+                file_path = os.path.join(sub_path, fname)
+                status_label.config(text=f"正在處理: {sub} -> {fname}")
+                root.update_idletasks()
+
+                # 嘗試讀取 sheet
+                try:
+                    df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+                except Exception as e:
+                    # 讀檔失敗，將該次測量所有量值填 NaN，並繼續
+                    row[f'{key_prefix}_Error'] = str(e)
+                    for rname, _ in ranges:
+                        row[f'{rname}_{key_prefix}_Sum'] = float('nan')
+                        row[f'{rname}_{key_prefix}_Mean'] = float('nan')
+                        row[f'{rname}_{key_prefix}_Max'] = float('nan')
+                    continue
+
+                # 對每個 range 計算 Sum / Mean / Max
+                for rname, rng in ranges:
+                    try:
+                        vals = extract_numeric_from_df_range(df, rng)
+                        if vals.empty:
+                            ssum = float('nan'); smean = float('nan'); smax = float('nan')
+                        else:
+                            ssum = float(vals.sum())
+                            smean = float(vals.mean())
+                            smax = float(vals.max())
+                    except Exception:
+                        ssum = float('nan'); smean = float('nan'); smax = float('nan')
+                    row[f'{rname}_{key_prefix}_Sum'] = ssum
+                    row[f'{rname}_{key_prefix}_Mean'] = smean
+                    row[f'{rname}_{key_prefix}_Max'] = smax
+            else:
+                # 沒有此測量檔，填空值
+                row[f'{key_prefix}_FileName'] = ''
+                for rname, _ in ranges:
+                    row[f'{rname}_{key_prefix}_Sum'] = float('nan')
+                    row[f'{rname}_{key_prefix}_Mean'] = float('nan')
+                    row[f'{rname}_{key_prefix}_Max'] = float('nan')
+
+        results.append(row)
+
+        # 更新進度
+        processed += 1
+        prog = int((processed / total) * 100)
+        progress_bar['value'] = prog
+        root.update_idletasks()
+
+    # 建立 DataFrame 並輸出
+    summary_df = pd.DataFrame(results)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    out_name = f"summary_{timestamp}.xlsx"
+    out_path = os.path.join(main_folder, out_name)
+    try:
+        summary_df.to_excel(out_path, index=False)
+    except Exception as e:
+        messagebox.showerror("錯誤", f"儲存 summary 檔案時發生錯誤：{e}")
+        return
+
+    # 完成顯示
+    progress_bar['value'] = 100
+    status_label.config(text=f"處理完成，已產生：{out_name}")
+    root.update_idletasks()
+    messagebox.showinfo("完成", f"已完成所有子資料夾的處理。\n結果存於：\n{out_path}")
+
+    # 嘗試自動開啟檔案（若作業系統支援）
+    try_open_file(out_path)
+
+
+# ---------- GUI ----------
+def browse_main_folder():
+    folder = filedialog.askdirectory(title="選擇主資料夾（包含多個 X_xxxmm 子資料夾）")
+    if folder:
+        main_folder_var.set(folder)
+
+def start_button_clicked():
+    main_folder = main_folder_var.get().strip()
+    main_keyword = main_keyword_entry.get().strip()
+    sheet_name = sheet_name_entry.get().strip()
+    range1 = range1_entry.get().strip()
+    range2 = range2_entry.get().strip()
+
+    if not main_folder:
+        messagebox.showwarning("警告", "請選擇主資料夾。")
+        return
+    if not sheet_name:
+        messagebox.showwarning("警告", "請輸入要處理的 sheet 名稱（例如 Original_Data）。")
+        return
+    if not range1:
+        messagebox.showwarning("警告", "請至少輸入區間1（例如 B2:TF61）。")
+        return
+
+    # 啟動處理
+    process_main_folder(main_folder, main_keyword, sheet_name, range1, range2, progress_bar, status_label)
+
+
+root = tk.Tk()
+root.title("Excel 多資料夾整合工具 v3")
+root.geometry("680x420")
+
+main_folder_var = tk.StringVar()
+
+frame_top = tk.Frame(root)
+frame_top.pack(padx=12, pady=8, anchor='w')
+
+tk.Label(frame_top, text="主資料夾（包含多個子資料夾，如 X_0.400mm）:").grid(row=0, column=0, sticky='w')
+tk.Entry(frame_top, textvariable=main_folder_var, width=60).grid(row=1, column=0, pady=4, sticky='w')
+tk.Button(frame_top, text="瀏覽", command=browse_main_folder).grid(row=1, column=1, padx=6)
+
+tk.Label(frame_top, text="主要檔名關鍵字（可空白，若填入只處理包含此字串之 Excel 檔）:").grid(row=2, column=0, sticky='w', pady=(8,0))
+main_keyword_entry = tk.Entry(frame_top, width=30)
+main_keyword_entry.grid(row=3, column=0, sticky='w')
+
+tk.Label(frame_top, text="要處理的 Sheet 名稱 (例如: Original_Data):").grid(row=4, column=0, sticky='w', pady=(8,0))
+sheet_name_entry = tk.Entry(frame_top, width=30)
+sheet_name_entry.grid(row=5, column=0, sticky='w')
+
+tk.Label(frame_top, text="區間1 (例如 B2:TF61) * 必填:").grid(row=6, column=0, sticky='w', pady=(8,0))
+range1_entry = tk.Entry(frame_top, width=20)
+range1_entry.grid(row=7, column=0, sticky='w')
+
+tk.Label(frame_top, text="區間2 (例如 TG2:ANK61) (可選):").grid(row=8, column=0, sticky='w', pady=(8,0))
+range2_entry = tk.Entry(frame_top, width=20)
+range2_entry.grid(row=9, column=0, sticky='w')
+
+tk.Button(root, text="執行整合", command=start_button_clicked, bg="#4CAF50", fg="white", font=('Arial', 12, 'bold')).pack(pady=12)
+
+progress_frame = tk.Frame(root)
+progress_frame.pack(pady=4)
+progress_bar = ttk.Progressbar(progress_frame, orient='horizontal', length=560, mode='determinate')
+progress_bar.pack(pady=6)
+status_label = tk.Label(progress_frame, text="尚未開始")
+status_label.pack()
+
+root.mainloop()
